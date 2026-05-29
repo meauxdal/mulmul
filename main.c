@@ -123,7 +123,7 @@ static void phase1(void)
 
     debugf("# PHASE1 begin: b1 independence check\n");
     debugf("# a1=%08lX a2=%08lX b2=%08lX samples=%lu\n",
-           a1, a2, b2, PHASE1_SAMPLES);
+           a1, a2, b2, (uint32_t)PHASE1_SAMPLES);
     debugf("# cols: phase,a1,b1,a2,b2,broken,working,xor\n");
 
     console_clear();

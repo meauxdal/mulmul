@@ -9,25 +9,39 @@
  * Zero, or Infinity. A single intervening NOP prevents the corruption.
  * Empirically the corruption appears in the low mantissa bits only.
  *
+ * Key design note: b2 must NOT be 1.0 (or any value that makes a2*b2 exact).
+ * When a2*b2 is representable without rounding, the FPU rounding stage is
+ * a no-op and the corruption does not manifest. Using b2=0x3F8CCCCD (~1.1,
+ * not exactly representable) forces rounding for nearly all a2 values,
+ * matching the conditions under which ctest.cpp observed hits.
+ *
  * Phases (run sequentially):
  *
- *   Phase 1 — b1 independence check (~instant)
- *     a1=+0, a2=1.5, b2=1.5 (product=2.25, exact in FP)
+ *   Sanity — known-triggering input
+ *     Tests the specific input from the Buu42 log known to trigger the bug
+ *     on affected hardware: (7F800000 * 37BAD25F, 38978B5D * 0C50A394).
+ *     Expected broken=05770421, working=05770422 on rev 1.x hardware.
+ *     If broken==working here, the asm or hardware is not exhibiting the bug
+ *     and subsequent phases will produce no data.
+ *
+ *   Phase 1 — b1 independence check
+ *     a1=+0, a2=0x3D4CCCCD (~0.05), b2=0x3F8CCCCD (~1.1, forces rounding)
  *     b1 sampled at PHASE1_SAMPLES evenly-spaced normal values.
  *     Question: does b1's value change the broken result for fixed (a2,b2)?
  *     If all mismatches yield the same broken bits regardless of b1 → b1
  *     is irrelevant to the corruption; only the trigger type matters.
  *
- *   Phase 2 — mantissa sweep per trigger type (~4.5 sec each)
- *     a1 ∈ {+0, −0, +inf, −inf}, b1=1.0, b2=1.0
- *     a2 sweeps all 2^23 mantissa values at exp=127 (1.0 ≤ a2 < 2.0).
- *     Since a2 * 1.0 = a2 exactly in IEEE 754, working = a2.
- *     Any broken != working is directly the corruption as a function of a2.
- *     Question: does trigger type ({+0,−0,+inf,−inf}) change the pattern?
+ *   Phase 2 — mantissa sweep per trigger type
+ *     a1 ∈ {+0, −0, +inf, −inf}, b1=0x3F8CCCCD (~1.1)
+ *     a2 sweeps all 2^23 mantissa values at exp=117 (small normals).
+ *     b2=0x3F8CCCCD (~1.1, forces rounding for all a2 in this band).
+ *     Repeated for each trigger type to see if {+0,−0,+inf,−inf} produce
+ *     identical or distinct corruption patterns.
  *
- *   Phase 3 — full positive-normal sweep (~19 min)
- *     a1=+0, b1=1.0, b2=1.0; a2 = all positive normal floats.
+ *   Phase 3 — full positive-normal a2 sweep
+ *     a1=+0, b1=b2=0x3F8CCCCD (~1.1); a2 = all positive normal floats.
  *     Complete characterization for the canonical trigger type.
+ *     Expected runtime: ~19 minutes on hardware.
  *
  * All mismatches logged to debugf as CSV:
  *   phase,a1_bits,b1_bits,a2_bits,b2_bits,broken_bits,working_bits,xor_bits
@@ -40,6 +54,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <libdragon.h>
+
+/*
+ * b2 used throughout phases 1-3. Must not be 1.0 or any value that makes
+ * a2*b2 exactly representable for the a2 ranges under test. 0x3F8CCCCD is
+ * the nearest float to 1.1 and is not exactly representable in binary,
+ * so it forces rounding for nearly all normal a2 values.
+ */
+#define B2_FORCING  0x3F8CCCCDu   /* ~1.1, forces rounding */
 
 /* -------------------------------------------------------------------------
  * Core probe
@@ -98,23 +120,75 @@ static inline void log_mismatch(const char *phase,
 }
 
 /* -------------------------------------------------------------------------
- * Phase 1: b1 independence check
+ * Sanity check
  *
- * Fixed: a1=+0, a2=1.5 (0x3FC00000), b2=1.5 (0x3FC00000), product=2.25 exact.
- * Sweep: b1 sampled at PHASE1_SAMPLES evenly-spaced normal bit patterns.
- *
- * Conclusion printed to both screen and debugf:
- *   "b1 matters" if any two mismatches yield different broken bits.
- *   "b1 does not matter" if all mismatches yield the same broken bits.
+ * Tests the exact input from the Buu42 log known to trigger the bug.
+ * Prints result to both screen and debug regardless of pass/fail.
+ * If broken==working, the bug is absent on this hardware and subsequent
+ * phases will produce no meaningful data.
  * ---------------------------------------------------------------------- */
 
-#define PHASE1_SAMPLES 4096
+static bool sanity(void)
+{
+    /* From mulmul-test-log-buu42.txt, last entry — confirmed on rev 1.x */
+    const uint32_t a1 = 0x7F800000;  /* +inf */
+    const uint32_t b1 = 0x37BAD25F;
+    const uint32_t a2 = 0x38978B5D;
+    const uint32_t b2 = 0x0C50A394;
+    const uint32_t expected_broken  = 0x05770421;
+    const uint32_t expected_working = 0x05770422;
+
+    uint32_t broken, working;
+    mulmul_probe(a1, b1, a2, b2, &broken, &working);
+
+    bool bug_present  = (broken != working);
+    bool result_match = (broken == expected_broken && working == expected_working);
+
+    debugf("# SANITY: a1=%08lX b1=%08lX a2=%08lX b2=%08lX\n", a1, b1, a2, b2);
+    debugf("# SANITY: broken=%08lX working=%08lX xor=%08lX\n",
+           broken, working, broken ^ working);
+    debugf("# SANITY: bug_present=%s result_match=%s\n",
+           bug_present  ? "YES" : "NO",
+           result_match ? "YES" : "NO");
+
+    console_clear();
+    printf("Sanity check (known-triggering input)\n\n");
+    printf("  a1=%08lX b1=%08lX\n", a1, b1);
+    printf("  a2=%08lX b2=%08lX\n\n", a2, b2);
+    printf("  broken  = %08lX  (expect %08lX)\n", broken,  expected_broken);
+    printf("  working = %08lX  (expect %08lX)\n", working, expected_working);
+    printf("  xor     = %08lX\n\n", broken ^ working);
+
+    if (!bug_present) {
+        printf("  RESULT: bug NOT present on this hardware.\n");
+        printf("  Subsequent phases will produce no hits.\n");
+    } else if (result_match) {
+        printf("  RESULT: bug confirmed, values match log.\n");
+    } else {
+        printf("  RESULT: bug present but values differ from log.\n");
+        printf("  (Different hardware revision? Proceed anyway.)\n");
+    }
+
+    console_render();
+    return bug_present;
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 1: b1 independence check
+ *
+ * Fixed: a1=+0, a2=0x3D4CCCCD (~0.05), b2=B2_FORCING (~1.1).
+ * Product is not exactly representable, so rounding occurs and the
+ * corruption has a chance to manifest.
+ * Sweep: b1 sampled at PHASE1_SAMPLES evenly-spaced normal bit patterns.
+ * ---------------------------------------------------------------------- */
+
+#define PHASE1_SAMPLES 4096u
 
 static void phase1(void)
 {
-    const uint32_t a1 = 0x00000000;   /* +0   */
-    const uint32_t a2 = 0x3FC00000;   /* 1.5  */
-    const uint32_t b2 = 0x3FC00000;   /* 1.5, correct product = 2.25 = 0x40100000 */
+    const uint32_t a1 = 0x00000000;   /* +0            */
+    const uint32_t a2 = 0x3D4CCCCDu;  /* ~0.05         */
+    const uint32_t b2 = B2_FORCING;   /* ~1.1          */
 
     uint32_t mismatch_count = 0;
     uint32_t first_broken   = 0;
@@ -124,13 +198,12 @@ static void phase1(void)
     debugf("# PHASE1 begin: b1 independence check\n");
     debugf("# a1=%08lX a2=%08lX b2=%08lX samples=%lu\n",
            a1, a2, b2, (uint32_t)PHASE1_SAMPLES);
-    debugf("# cols: phase,a1,b1,a2,b2,broken,working,xor\n");
 
     console_clear();
-    printf("Phase 1: b1 independence check (%lu samples)\n", (uint32_t)PHASE1_SAMPLES);
+    printf("Phase 1: b1 independence check (%lu samples)\n",
+           (uint32_t)PHASE1_SAMPLES);
     console_render();
 
-    /* Step through positive-normal bit space in PHASE1_SAMPLES equal strides. */
     uint64_t step = (uint64_t)(0x7F7FFFFFu - 0x00800000u) / PHASE1_SAMPLES;
 
     for (uint32_t i = 0; i < PHASE1_SAMPLES; i++) {
@@ -163,33 +236,29 @@ static void phase1(void)
 }
 
 /* -------------------------------------------------------------------------
- * Phase 2: mantissa sweep per trigger type, exp=127, b2=1.0
+ * Phase 2: mantissa sweep per trigger type
  *
- * a2 sweeps all 2^23 mantissa values at exponent 127 (1.0 ≤ a2 < 2.0).
- * b2=1.0 so the IEEE 754 correct result of a2*b2 is a2 exactly.
- * Any broken != working is therefore broken != a2, directly exposing the
- * corruption as a function of a2's bit pattern.
- *
- * Called once per trigger type to test whether {+0,−0,+inf,−inf} produce
- * identical or distinct corruption patterns.
+ * a2 sweeps all 2^23 mantissa values at exp=117 (small normals,
+ * matching the range of second-pair products seen in the Buu42 log).
+ * b2=B2_FORCING (~1.1) forces rounding for all a2 in this band.
  * ---------------------------------------------------------------------- */
 
 static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
 {
-    const uint32_t b2            = 0x3F800000;  /* 1.0 */
-    const uint32_t exp127_base   = 127u << 23;
-    const uint32_t mantissa_max  = 1u << 23;
+    const uint32_t b2           = B2_FORCING;
+    const uint32_t exp117_base  = 117u << 23;
+    const uint32_t mantissa_max = 1u << 23;
     uint32_t       mismatch_count = 0;
 
-    debugf("# %s begin: a1=%08lX b1=%08lX b2=1.0 exp=127\n",
-           phase_tag, a1, b1);
+    debugf("# %s begin: a1=%08lX b1=%08lX b2=%08lX exp=117\n",
+           phase_tag, a1, b1, b2);
 
     console_clear();
-    printf("%s: mantissa sweep [0..%lu)\n", phase_tag, mantissa_max);
+    printf("%s: mantissa sweep exp=117 [0..%lu)\n", phase_tag, mantissa_max);
     console_render();
 
     for (uint32_t mant = 0; mant < mantissa_max; mant++) {
-        uint32_t a2 = exp127_base | mant;
+        uint32_t a2 = exp117_base | mant;
         uint32_t broken, working;
         mulmul_probe(a1, b1, a2, b2, &broken, &working);
 
@@ -198,7 +267,6 @@ static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
             mismatch_count++;
         }
 
-        /* Progress update every 64K iterations (~1.5% steps) */
         if ((mant & 0xFFFF) == 0) {
             console_clear();
             printf("%s: %lu / %lu  mismatches: %lu\n",
@@ -214,10 +282,6 @@ static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
 
 static void phase2(void)
 {
-    /*
-     * Four canonical trigger types in the first-pair position.
-     * b1=1.0 in all cases (non-trigger, value chosen to be inert).
-     */
     static const struct {
         uint32_t    a1;
         const char *tag;
@@ -229,7 +293,7 @@ static void phase2(void)
         { 0xFF800000, "P2_infn", "-inf" },
     };
 
-    const uint32_t b1 = 0x3F800000;  /* 1.0 */
+    const uint32_t b1 = B2_FORCING;  /* ~1.1, non-trigger normal */
 
     for (size_t i = 0; i < sizeof(triggers) / sizeof(triggers[0]); i++) {
         debugf("# Phase 2 trigger: a1=%s\n", triggers[i].label);
@@ -240,29 +304,27 @@ static void phase2(void)
 /* -------------------------------------------------------------------------
  * Phase 3: full positive-normal a2 sweep
  *
- * Same as Phase 2 but a2 covers all positive normal floats (exp 1..254),
- * not just exp=127. Canonical trigger: a1=+0, b1=1.0, b2=1.0.
+ * a1=+0, b1=b2=B2_FORCING; a2 = all positive normal floats.
  * Expected runtime: ~19 minutes on hardware.
  * ---------------------------------------------------------------------- */
 
 static void phase3(void)
 {
-    const uint32_t a1 = 0x00000000;  /* +0  */
-    const uint32_t b1 = 0x3F800000;  /* 1.0 */
-    const uint32_t b2 = 0x3F800000;  /* 1.0 */
+    const uint32_t a1 = 0x00000000;  /* +0   */
+    const uint32_t b1 = B2_FORCING;  /* ~1.1 */
+    const uint32_t b2 = B2_FORCING;  /* ~1.1 */
 
     uint32_t mismatch_count = 0;
 
     debugf("# PHASE3 begin: full positive-normal a2 sweep\n");
-    debugf("# a1=+0 b1=1.0 b2=1.0 range=[0x00800000..0x7F7FFFFF]\n");
+    debugf("# a1=+0 b1=%08lX b2=%08lX range=[0x00800000..0x7F7FFFFF]\n",
+           b1, b2);
 
     console_clear();
-    printf("Phase 3: full positive-normal sweep\n");
-    printf("(~19 minutes on hardware)\n");
+    printf("Phase 3: full positive-normal sweep (~19 min)\n");
     console_render();
 
     for (uint32_t a2 = 0x00800000u; a2 <= 0x7F7FFFFFu; a2++) {
-        /* All values in this range are normal; no is_normal() check needed. */
         uint32_t broken, working;
         mulmul_probe(a1, b1, a2, b2, &broken, &working);
 
@@ -271,8 +333,7 @@ static void phase3(void)
             mismatch_count++;
         }
 
-        /* Progress update every 256K iterations (~3.2% steps) */
-        if ((a2 & 0x3FFFF) == 0) {
+        if ((a2 & 0x3FFFFu) == 0) {
             console_clear();
             printf("Phase 3: a2=%08lX  mismatches: %lu\n", a2, mismatch_count);
             console_render();
@@ -297,30 +358,34 @@ int main(void)
     console_set_render_mode(RENDER_MANUAL);
     console_clear();
 
-    /*
-     * Disable FP exceptions that would fire on the trigger operands
-     * (invalid operation, divide-by-zero, overflow) for the duration
-     * of the sweep.
-     */
     uint32_t fcr31_saved = C1_FCR31();
     C1_WRITE_FCR31(fcr31_saved &
         ~(C1_ENABLE_OVERFLOW | C1_ENABLE_DIV_BY_0 | C1_ENABLE_INVALID_OP));
 
     printf("mulmul characterization ROM\n");
-    printf("output → USB debug (CSV)\n\n");
+    printf("output -> USB debug (CSV)\n\n");
     console_render();
 
     debugf("# mulmul characterization ROM\n");
     debugf("# cols: phase,a1,b1,a2,b2,broken,working,xor\n");
 
-    phase1();
-    phase2();
-    phase3();
+    bool bug_present = sanity();
+
+    if (bug_present) {
+        phase1();
+        phase2();
+        phase3();
+    } else {
+        console_clear();
+        printf("Bug not present on this hardware.\n");
+        printf("Phases 1-3 skipped.\n");
+        console_render();
+    }
 
     C1_WRITE_FCR31(fcr31_saved);
 
     console_clear();
-    printf("All phases complete.\n");
+    printf(bug_present ? "All phases complete.\n" : "Done (no bug).\n");
     console_render();
 
     while (1) {}

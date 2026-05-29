@@ -93,7 +93,7 @@ static inline void log_mismatch(const char *phase,
                                 uint32_t a2, uint32_t b2,
                                 uint32_t broken, uint32_t working)
 {
-    debugf("%s,%08X,%08X,%08X,%08X,%08X,%08X,%08X\n",
+    debugf("%s,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX\n",
            phase, a1, b1, a2, b2, broken, working, broken ^ working);
 }
 
@@ -122,12 +122,12 @@ static void phase1(void)
     bool     b1_matters     = false;
 
     debugf("# PHASE1 begin: b1 independence check\n");
-    debugf("# a1=%08X a2=%08X b2=%08X samples=%u\n",
+    debugf("# a1=%08lX a2=%08lX b2=%08lX samples=%lu\n",
            a1, a2, b2, PHASE1_SAMPLES);
     debugf("# cols: phase,a1,b1,a2,b2,broken,working,xor\n");
 
     console_clear();
-    printf("Phase 1: b1 independence check (%u samples)\n", PHASE1_SAMPLES);
+    printf("Phase 1: b1 independence check (%lu samples)\n", (uint32_t)PHASE1_SAMPLES);
     console_render();
 
     /* Step through positive-normal bit space in PHASE1_SAMPLES equal strides. */
@@ -155,9 +155,9 @@ static void phase1(void)
 
     const char *verdict = b1_matters ? "YES — full b1 sweep needed"
                                      : "NO  — b1 value irrelevant";
-    debugf("# PHASE1 done: mismatches=%u b1_matters=%s\n",
+    debugf("# PHASE1 done: mismatches=%lu b1_matters=%s\n",
            mismatch_count, verdict);
-    printf("Phase 1 done: %u mismatches  b1 matters: %s\n\n",
+    printf("Phase 1 done: %lu mismatches  b1 matters: %s\n\n",
            mismatch_count, verdict);
     console_render();
 }
@@ -181,11 +181,11 @@ static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
     const uint32_t mantissa_max  = 1u << 23;
     uint32_t       mismatch_count = 0;
 
-    debugf("# %s begin: a1=%08X b1=%08X b2=1.0 exp=127\n",
+    debugf("# %s begin: a1=%08lX b1=%08lX b2=1.0 exp=127\n",
            phase_tag, a1, b1);
 
     console_clear();
-    printf("%s: mantissa sweep [0..%u)\n", phase_tag, mantissa_max);
+    printf("%s: mantissa sweep [0..%lu)\n", phase_tag, mantissa_max);
     console_render();
 
     for (uint32_t mant = 0; mant < mantissa_max; mant++) {
@@ -201,14 +201,14 @@ static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
         /* Progress update every 64K iterations (~1.5% steps) */
         if ((mant & 0xFFFF) == 0) {
             console_clear();
-            printf("%s: %u / %u  mismatches: %u\n",
+            printf("%s: %lu / %lu  mismatches: %lu\n",
                    phase_tag, mant, mantissa_max, mismatch_count);
             console_render();
         }
     }
 
-    debugf("# %s done: mismatches=%u\n", phase_tag, mismatch_count);
-    printf("%s done: %u mismatches\n\n", phase_tag, mismatch_count);
+    debugf("# %s done: mismatches=%lu\n", phase_tag, mismatch_count);
+    printf("%s done: %lu mismatches\n\n", phase_tag, mismatch_count);
     console_render();
 }
 
@@ -274,13 +274,13 @@ static void phase3(void)
         /* Progress update every 256K iterations (~3.2% steps) */
         if ((a2 & 0x3FFFF) == 0) {
             console_clear();
-            printf("Phase 3: a2=%08X  mismatches: %u\n", a2, mismatch_count);
+            printf("Phase 3: a2=%08lX  mismatches: %lu\n", a2, mismatch_count);
             console_render();
         }
     }
 
-    debugf("# PHASE3 done: mismatches=%u\n", mismatch_count);
-    printf("Phase 3 done: %u mismatches\n\n", mismatch_count);
+    debugf("# PHASE3 done: mismatches=%lu\n", mismatch_count);
+    printf("Phase 3 done: %lu mismatches\n\n", mismatch_count);
     console_render();
 }
 

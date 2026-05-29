@@ -10,7 +10,7 @@ jobs:
 
     env:
       N64_INST: /n64_toolchain
-      LIBDRAGON_COMMIT: c60bfbfc2c44b86e3627b06640b0260b89788118
+      LIBDRAGON_COMMIT: f667dd2bf8daa5734eef309367013623ee38fad5
 
     steps:
       - uses: actions/checkout@v6

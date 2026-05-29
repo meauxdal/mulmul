@@ -25,9 +25,11 @@ jobs:
       - name: Build libdragon (preview)
         if: steps.cache-libdragon.outputs.cache-hit != 'true'
         run: |
-          git clone --depth=1 https://github.com/DragonMinded/libdragon.git /tmp/libdragon
+          git init /tmp/libdragon
           cd /tmp/libdragon
-          git checkout $LIBDRAGON_COMMIT
+          git remote add origin https://github.com/DragonMinded/libdragon.git
+          git fetch --depth=1 origin $LIBDRAGON_COMMIT
+          git checkout FETCH_HEAD
           ./build.sh $N64_INST
 
       - name: Build ROM

@@ -14,13 +14,15 @@
 #define PHASE1_LOG_LIMIT  100u
 #define PHASE2_LOG_LIMIT  90000u
 #define PHASE3_LOG_LIMIT  90000u
-#define MAX_LOGGED_MISMATCHES (PHASE1_LOG_LIMIT + PHASE2_LOG_LIMIT + PHASE3_LOG_LIMIT)
+#define PHASE4_LOG_LIMIT  100u
+#define MAX_LOGGED_MISMATCHES (PHASE1_LOG_LIMIT + PHASE2_LOG_LIMIT + PHASE3_LOG_LIMIT + PHASE4_LOG_LIMIT)
 
 static uint32_t total_discovered = 0;
 static uint32_t total_logged = 0;
 static uint32_t logged_phase1 = 0;
 static uint32_t logged_phase2 = 0;
 static uint32_t logged_phase3 = 0;
+static uint32_t logged_phase4 = 0;
 
 /* -------------------------------------------------------------------------
  * Core probe
@@ -179,7 +181,6 @@ static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
             }
         }
 
-        // Lightweight UI progress tick (~every 64 outer loops)
         if ((base_mant & 0x7FFF) == 0) {
             console_clear();
             printf("Running Phase 2 (%s)...\n", phase_tag);
@@ -221,7 +222,7 @@ static void phase3(void)
     uint32_t mismatch_count = 0;
     debugf("# PHASE3 begin: Targeted Exponent & Rounding Sweep\n");
 
-    for (uint32_t exp = 1; exp < 255; exp++) {
+    for (uint32_t exp = 1; exp < 255; exp += 5) {
         uint32_t exp_base = exp << 23;
 
         for (uint32_t base_mant = 0; base_mant < (1u << 23); base_mant += 4096) {
@@ -252,7 +253,6 @@ static void phase3(void)
             }
         }
 
-        // Visual reassurance for the tester every 8 exponents
         if ((exp & 0x07) == 0) {
             console_clear();
             printf("Running Phase 3 (Exp %lu/254)...\n", exp);
@@ -262,6 +262,54 @@ static void phase3(void)
         }
     }
     debugf("# PHASE3 done: mismatches=%lu\n", mismatch_count);
+}
+
+/* -------------------------------------------------------------------------
+ * Phase 4: Targeted boundary alignment sweep (0x0A00 spike hypothesis)
+ * ---------------------------------------------------------------------- */
+static void phase4(void)
+{
+    const uint32_t a1 = 0x00000000;
+    const uint32_t b1 = B2_FORCING;
+    const uint32_t b2 = B2_FORCING;
+    const uint32_t exp_base = 117u << 23;
+    uint32_t mismatch_count = 0;
+    uint32_t ui_tick_counter = 0;
+
+    debugf("# PHASE4 begin: Boundary alignment spike sweep\n");
+
+    /* Probe mantissas at suspected spike boundaries (0x0A00, 0x1400, 0x1E00, etc.) */
+    for (uint32_t boundary = 0x0A00; boundary < (1u << 23); boundary += 0x0A00) {
+        
+        /* Dense local sweep around each boundary */
+        for (int offset = -128; offset <= 128; offset += 16) {
+            
+            /* Resolve math explicitly as signed integers before bounds checking */
+            int32_t signed_mant = (int32_t)boundary + offset;
+            if (signed_mant < 0 || signed_mant >= (int32_t)(1u << 23)) continue;
+
+            uint32_t a2 = exp_base | (uint32_t)signed_mant;
+            uint32_t broken, working;
+            mulmul_probe(a1, b1, a2, b2, &broken, &working);
+
+            if (broken != working) {
+                log_mismatch("P4", a1, b1, a2, b2, broken, working,
+                             &logged_phase4, PHASE4_LOG_LIMIT);
+                mismatch_count++;
+            }
+        }
+
+        /* Periodic UI update (~every 128 boundaries) */
+        if ((++ui_tick_counter & 0x7F) == 0) {
+            console_clear();
+            printf("Running Phase 4 (Boundary %08lX)...\n", boundary);
+            printf("Total mismatches found: %lu\n", total_discovered);
+            printf("USB logs written:      %lu / %u\n", total_logged, MAX_LOGGED_MISMATCHES);
+            console_render();
+        }
+    }
+
+    debugf("# PHASE4 done: mismatches=%lu\n", mismatch_count);
 }
 
 /* -------------------------------------------------------------------------
@@ -284,13 +332,14 @@ int main(void)
     debugf("# mulmul characterization ROM (Fast-Targeted)\n");
     debugf("# cols: phase,a1,b1,a2,b2,broken,working,xor\n");
     debugf("# logging first %u mismatches only; later mismatches are counted but not detailed\n", MAX_LOGGED_MISMATCHES);
-    debugf("# phase budget: P1=%u, P2=%u, P3=%u\n", PHASE1_LOG_LIMIT, PHASE2_LOG_LIMIT, PHASE3_LOG_LIMIT);
+    debugf("# phase budget: P1=%u, P2=%u, P3=%u, P4=%u\n", PHASE1_LOG_LIMIT, PHASE2_LOG_LIMIT, PHASE3_LOG_LIMIT, PHASE4_LOG_LIMIT);
 
     (void)sanity();
 
     phase1();
     phase2();
     phase3();
+    phase4();
 
     console_clear();
     printf("All phases complete.\n");

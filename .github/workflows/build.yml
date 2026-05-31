@@ -38,5 +38,6 @@ jobs:
       - name: Upload ROM
         uses: actions/upload-artifact@v7
         with:
-          name: mulmul_characterize
-          path: mulmul_characterize.z64
+          name: mulmul_timing
+          path: mulmul_timing.z64
+		  

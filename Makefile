@@ -1,5 +1,5 @@
-N64_INST  = /n64_toolchain
-PROG_NAME = mulmul_characterize
+N64_INST   = /n64_toolchain
+PROG_NAME  = mulmul_timing
 
 all: $(PROG_NAME).z64
 

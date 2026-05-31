@@ -10,7 +10,17 @@
 #include <stdbool.h>
 #include <libdragon.h>
 
-#define B2_FORCING  0x3F8CCCCDu   /* ~1.1, forces rounding */
+#define B2_FORCING        0x3F8CCCCDu   /* ~1.1, forces rounding */
+#define PHASE1_LOG_LIMIT  100u
+#define PHASE2_LOG_LIMIT  90000u
+#define PHASE3_LOG_LIMIT  90000u
+#define MAX_LOGGED_MISMATCHES (PHASE1_LOG_LIMIT + PHASE2_LOG_LIMIT + PHASE3_LOG_LIMIT)
+
+static uint32_t total_discovered = 0;
+static uint32_t total_logged = 0;
+static uint32_t logged_phase1 = 0;
+static uint32_t logged_phase2 = 0;
+static uint32_t logged_phase3 = 0;
 
 /* -------------------------------------------------------------------------
  * Core probe
@@ -51,8 +61,14 @@ static inline bool is_normal(uint32_t bits)
 static inline void log_mismatch(const char *phase,
                                 uint32_t a1, uint32_t b1,
                                 uint32_t a2, uint32_t b2,
-                                uint32_t broken, uint32_t working)
+                                uint32_t broken, uint32_t working,
+                                uint32_t *phase_logged, uint32_t phase_limit)
 {
+    total_discovered++;
+    if (*phase_logged >= phase_limit) return;
+    (*phase_logged)++;
+    total_logged++;
+
     debugf("%s,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX\n",
            phase, a1, b1, a2, b2, broken, working, broken ^ working);
 }
@@ -111,7 +127,8 @@ static void phase1(void)
         mulmul_probe(a1, b1, a2, b2, &broken, &working);
 
         if (broken != working) {
-            log_mismatch("P1", a1, b1, a2, b2, broken, working);
+            log_mismatch("P1", a1, b1, a2, b2, broken, working,
+                         &logged_phase1, PHASE1_LOG_LIMIT);
             mismatch_count++;
 
             if (!first_set) {
@@ -128,7 +145,7 @@ static void phase1(void)
 }
 
 /* -------------------------------------------------------------------------
- * Phase 2: Targeted carry-chain mantissa sweep (~32K iterations)
+ * Phase 2: Targeted carry-chain mantissa sweep
  * ---------------------------------------------------------------------- */
 static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
 {
@@ -138,9 +155,7 @@ static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
 
     debugf("# %s begin: Targeted sweep\n", phase_tag);
 
-    // Stride through the mantissa space, but force trailing carry-chain targets
     for (uint32_t base_mant = 0; base_mant < (1u << 23); base_mant += 512) {
-        // Test a few variations that force carry propagation via low-bit density
         uint32_t test_mantissas[] = {
             base_mant,
             base_mant | 0x1F,
@@ -158,9 +173,19 @@ static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
             mulmul_probe(a1, b1, a2, b2, &broken, &working);
 
             if (broken != working) {
-                log_mismatch(phase_tag, a1, b1, a2, b2, broken, working);
+                log_mismatch(phase_tag, a1, b1, a2, b2, broken, working,
+                             &logged_phase2, PHASE2_LOG_LIMIT);
                 mismatch_count++;
             }
+        }
+
+        // Lightweight UI progress tick (~every 64 outer loops)
+        if ((base_mant & 0x7FFF) == 0) {
+            console_clear();
+            printf("Running Phase 2 (%s)...\n", phase_tag);
+            printf("Total mismatches found: %lu\n", total_discovered);
+            printf("USB logs written:      %lu / %u\n", total_logged, MAX_LOGGED_MISMATCHES);
+            console_render();
         }
     }
     debugf("# %s done: mismatches=%lu\n", phase_tag, mismatch_count);
@@ -185,7 +210,7 @@ static void phase2(void)
 }
 
 /* -------------------------------------------------------------------------
- * Phase 3: Exponent Sweep + Precision Carry-Chain testing (~50K iterations)
+ * Phase 3: Exponent Sweep + Precision Carry-Chain testing
  * ---------------------------------------------------------------------- */
 static void phase3(void)
 {
@@ -196,12 +221,9 @@ static void phase3(void)
     uint32_t mismatch_count = 0;
     debugf("# PHASE3 begin: Targeted Exponent & Rounding Sweep\n");
 
-    // Sweep all normal exponents (1 to 254)
     for (uint32_t exp = 1; exp < 255; exp++) {
         uint32_t exp_base = exp << 23;
 
-        // For every exponent, specifically probe across rounding boundaries
-        // targeting varying carry-chain depths
         for (uint32_t base_mant = 0; base_mant < (1u << 23); base_mant += 4096) {
             uint32_t edge_cases[] = {
                 base_mant,
@@ -223,10 +245,20 @@ static void phase3(void)
                 mulmul_probe(a1, b1, a2, b2, &broken, &working);
 
                 if (broken != working) {
-                    log_mismatch("P3", a1, b1, a2, b2, broken, working);
+                    log_mismatch("P3", a1, b1, a2, b2, broken, working,
+                                 &logged_phase3, PHASE3_LOG_LIMIT);
                     mismatch_count++;
                 }
             }
+        }
+
+        // Visual reassurance for the tester every 8 exponents
+        if ((exp & 0x07) == 0) {
+            console_clear();
+            printf("Running Phase 3 (Exp %lu/254)...\n", exp);
+            printf("Total mismatches found: %lu\n", total_discovered);
+            printf("USB logs written:      %lu / %u\n", total_logged, MAX_LOGGED_MISMATCHES);
+            console_render();
         }
     }
     debugf("# PHASE3 done: mismatches=%lu\n", mismatch_count);
@@ -251,22 +283,19 @@ int main(void)
 
     debugf("# mulmul characterization ROM (Fast-Targeted)\n");
     debugf("# cols: phase,a1,b1,a2,b2,broken,working,xor\n");
+    debugf("# logging first %u mismatches only; later mismatches are counted but not detailed\n", MAX_LOGGED_MISMATCHES);
+    debugf("# phase budget: P1=%u, P2=%u, P3=%u\n", PHASE1_LOG_LIMIT, PHASE2_LOG_LIMIT, PHASE3_LOG_LIMIT);
 
-    // Run the sanity check to log the baseline behavior, 
-    // but ignore the return value so we always run the phases.
     (void)sanity();
 
-    console_clear(); printf("Running P1...\n"); console_render();
     phase1();
-    
-    console_clear(); printf("P1 Done. Running P2...\n"); console_render();
     phase2();
-    
-    console_clear(); printf("P2 Done. Running P3...\n"); console_render();
     phase3();
 
     console_clear();
-    printf("All phases complete.\nCheck USB Log output.\n");
+    printf("All phases complete.\n");
+    printf("Total mismatches found: %lu\n", total_discovered);
+    printf("Total logs generated:   %lu\n", total_logged);
     console_render();
 
     while (1) {}

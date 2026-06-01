@@ -1,8 +1,18 @@
 /*
- * mulmul_characterize — VR4300 mulmul bug characterization ROM
+ * mulmul_characterize
  *
- * Purpose: Enumerate the input/output relationship of the mulmul FP hazard
- * on targeted rounding boundaries to stay under a 5-minute hardware testing window.
+ * Sweep A: b1 characterization
+ *   Fix a1=+0, a2=SWEEP_A_A2, b2=B2_FORCING.
+ *   Sweep b1 over every positive normal float (0x00800000..0x7F7FFFFF).
+ *   Goal: map b1_mant -> XOR to fully characterize b1's influence.
+ *
+ * Sweep B: a2 mantissa characterization
+ *   Fix a1=+0, b1=B2_FORCING, b2=B2_FORCING.
+ *   Sweep a2 mantissa 0x000000..0x7FFFFF step 1 at exp=117.
+ *   Goal: verify and densify the 5-step periodic XOR formula discovered
+ *   in Phase 2 (which sampled only step-512 and selected offsets).
+ *
+ * CSV cols: phase,a1,b1,a2,b2,broken,working,xor
  */
 
 #include <stdio.h>
@@ -10,22 +20,31 @@
 #include <stdbool.h>
 #include <libdragon.h>
 
-#define B2_FORCING        0x3F8CCCCDu   /* ~1.1, forces rounding */
-#define PHASE1_LOG_LIMIT  100u
-#define PHASE2_LOG_LIMIT  90000u
-#define PHASE3_LOG_LIMIT  90000u
-#define PHASE4_LOG_LIMIT  100u
-#define MAX_LOGGED_MISMATCHES (PHASE1_LOG_LIMIT + PHASE2_LOG_LIMIT + PHASE3_LOG_LIMIT + PHASE4_LOG_LIMIT)
+/* ~1.1: forces rounding in the second mul, triggering the hazard */
+#define B2_FORCING  0x3F8CCCCDu
 
-static uint32_t total_discovered = 0;
-static uint32_t total_logged = 0;
-static uint32_t logged_phase1 = 0;
-static uint32_t logged_phase2 = 0;
-static uint32_t logged_phase3 = 0;
-static uint32_t logged_phase4 = 0;
+/*
+ * Sweep A anchor: exp=117, mant=0x000C00.
+ * This value produced XOR=0x3FA in Phase 2: a large, clean signal.
+ * Same (a2, b2) pair as Phase 1's a2 trigger (0x3D4CCCCD) would also
+ * work; 0x3A800C00 is preferred because its XOR is larger and easier
+ * to distinguish in the b1 sweep.
+ */
+#define SWEEP_A_A2          0x3A800C00u
+
+/* exp=117, matching Phase 2 */
+#define SWEEP_B_EXP_BASE    (117u << 23)
+
+#define SWEEP_A_LOG_LIMIT   500000u
+#define SWEEP_B_LOG_LIMIT   500000u
+
+static uint32_t a_found  = 0;
+static uint32_t a_logged = 0;
+static uint32_t b_found  = 0;
+static uint32_t b_logged = 0;
 
 /* -------------------------------------------------------------------------
- * Core probe
+ * Core probe — unchanged from prior ROM
  * ---------------------------------------------------------------------- */
 static void mulmul_probe(uint32_t a1, uint32_t b1,
                          uint32_t a2, uint32_t b2,
@@ -54,262 +73,117 @@ static void mulmul_probe(uint32_t a1, uint32_t b1,
     *working_out = working;
 }
 
-static inline bool is_normal(uint32_t bits)
-{
-    uint32_t exp = (bits >> 23) & 0xFF;
-    return (exp != 0) && (exp != 0xFF);
-}
-
-static inline void log_mismatch(const char *phase,
-                                uint32_t a1, uint32_t b1,
-                                uint32_t a2, uint32_t b2,
-                                uint32_t broken, uint32_t working,
-                                uint32_t *phase_logged, uint32_t phase_limit)
-{
-    total_discovered++;
-    if (*phase_logged >= phase_limit) return;
-    (*phase_logged)++;
-    total_logged++;
-
-    debugf("%s,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX\n",
-           phase, a1, b1, a2, b2, broken, working, broken ^ working);
-}
-
 /* -------------------------------------------------------------------------
- * Sanity check
+ * Sanity check (from Buu42 logs of HailtoDodongo's mulmul test ROM)
  * ---------------------------------------------------------------------- */
 static bool sanity(void)
 {
-    const uint32_t a1 = 0x7F800000;  /* +inf */
-    const uint32_t b1 = 0x37BAD25F;
-    const uint32_t a2 = 0x38978B5D;
-    const uint32_t b2 = 0x0C50A394;
+    const uint32_t a1 = 0x7F800000u;
+    const uint32_t b1 = 0x37BAD25Fu;
+    const uint32_t a2 = 0x38978B5Du;
+    const uint32_t b2 = 0x0C50A394u;
 
     uint32_t broken, working;
     mulmul_probe(a1, b1, a2, b2, &broken, &working);
 
-    bool bug_present  = (broken != working);
-
-    debugf("# SANITY: a1=%08lX b1=%08lX a2=%08lX b2=%08lX\n", a1, b1, a2, b2);
-    debugf("# SANITY: broken=%08lX working=%08lX xor=%08lX\n", broken, working, broken ^ working);
+    debugf("# SANITY: broken=%08lX working=%08lX xor=%08lX\n",
+           broken, working, broken ^ working);
 
     console_clear();
     printf("Sanity check\n\n");
     printf("  broken  = %08lX\n  working = %08lX\n\n", broken, working);
     console_render();
 
-    return bug_present;
+    return (broken != working);
 }
 
 /* -------------------------------------------------------------------------
- * Phase 1: b1 independence check (4096 samples ~5 seconds)
+ * Sweep A: b1 sweep
+ *
+ * b1 ranges over all positive normals: exponent 1..254, any mantissa.
+ * That is exactly 0x00800000..0x7F7FFFFF.
+ * ~8.4 M iterations.
  * ---------------------------------------------------------------------- */
-#define PHASE1_SAMPLES 4096u
-
-static void phase1(void)
+static void sweep_a(void)
 {
-    const uint32_t a1 = 0x00000000;   /* +0            */
-    const uint32_t a2 = 0x3D4CCCCDu;  /* ~0.05         */
-    const uint32_t b2 = B2_FORCING;   /* ~1.1          */
+    const uint32_t a1 = 0x00000000u;
+    const uint32_t a2 = SWEEP_A_A2;
+    const uint32_t b2 = B2_FORCING;
 
-    uint32_t mismatch_count = 0;
-    uint32_t first_broken   = 0;
-    bool     first_set      = false;
-    bool     b1_matters     = false;
+    debugf("# SWEEP_A begin  a2=%08lX b2=%08lX\n", a2, b2);
 
-    debugf("# PHASE1 begin: b1 independence check\n");
-
-    uint64_t step = (uint64_t)(0x7F7FFFFFu - 0x00800000u) / PHASE1_SAMPLES;
-
-    for (uint32_t i = 0; i < PHASE1_SAMPLES; i++) {
-        uint32_t b1 = (uint32_t)(0x00800000u + (uint64_t)i * step);
-        if (!is_normal(b1)) continue;
+    for (uint32_t b1 = 0x00800000u; b1 <= 0x7F7FFFFFu; b1++) {
 
         uint32_t broken, working;
         mulmul_probe(a1, b1, a2, b2, &broken, &working);
 
         if (broken != working) {
-            log_mismatch("P1", a1, b1, a2, b2, broken, working,
-                         &logged_phase1, PHASE1_LOG_LIMIT);
-            mismatch_count++;
-
-            if (!first_set) {
-                first_broken = broken;
-                first_set    = true;
-            } else if (broken != first_broken) {
-                b1_matters = true;
-            }
-        }
-    }
-
-    const char *verdict = b1_matters ? "YES" : "NO";
-    debugf("# PHASE1 done: mismatches=%lu b1_matters=%s\n", mismatch_count, verdict);
-}
-
-/* -------------------------------------------------------------------------
- * Phase 2: Targeted carry-chain mantissa sweep
- * ---------------------------------------------------------------------- */
-static void phase2_one_trigger(uint32_t a1, uint32_t b1, const char *phase_tag)
-{
-    const uint32_t b2           = B2_FORCING;
-    const uint32_t exp117_base  = 117u << 23;
-    uint32_t       mismatch_count = 0;
-
-    debugf("# %s begin: Targeted sweep\n", phase_tag);
-
-    for (uint32_t base_mant = 0; base_mant < (1u << 23); base_mant += 512) {
-        uint32_t test_mantissas[] = {
-            base_mant,
-            base_mant | 0x1F,
-            base_mant | 0x3F,
-            base_mant | 0x7F,
-            base_mant | 0xFF
-        };
-
-        for(int m = 0; m < 5; m++) {
-            uint32_t mant = test_mantissas[m];
-            if (mant >= (1u << 23)) continue;
-
-            uint32_t a2 = exp117_base | mant;
-            uint32_t broken, working;
-            mulmul_probe(a1, b1, a2, b2, &broken, &working);
-
-            if (broken != working) {
-                log_mismatch(phase_tag, a1, b1, a2, b2, broken, working,
-                             &logged_phase2, PHASE2_LOG_LIMIT);
-                mismatch_count++;
+            a_found++;
+            if (a_logged < SWEEP_A_LOG_LIMIT) {
+                a_logged++;
+                debugf("SA,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX\n",
+                       a1, b1, a2, b2, broken, working, broken ^ working);
             }
         }
 
-        if ((base_mant & 0x7FFF) == 0) {
+        /* UI update roughly every 1M iterations */
+        if ((b1 & 0xFFFFFu) == 0x80000u) {
             console_clear();
-            printf("Running Phase 2 (%s)...\n", phase_tag);
-            printf("Total mismatches found: %lu\n", total_discovered);
-            printf("USB logs written:      %lu / %u\n", total_logged, MAX_LOGGED_MISMATCHES);
+            printf("Sweep A: b1 sweep\n\n");
+            printf("  b1      = %08lX\n", b1);
+            printf("  found   = %lu\n", a_found);
+            printf("  logged  = %lu / %lu\n", a_logged, (uint32_t)SWEEP_A_LOG_LIMIT);
             console_render();
         }
     }
-    debugf("# %s done: mismatches=%lu\n", phase_tag, mismatch_count);
-}
 
-static void phase2(void)
-{
-    static const struct {
-        uint32_t    a1;
-        const char *tag;
-    } triggers[] = {
-        { 0x00000000, "P2_0p"   },
-        { 0x80000000, "P2_0n"   },
-        { 0x7F800000, "P2_infp" },
-        { 0xFF800000, "P2_infn" },
-    };
-
-    const uint32_t b1 = B2_FORCING;
-    for (size_t i = 0; i < sizeof(triggers) / sizeof(triggers[0]); i++) {
-        phase2_one_trigger(triggers[i].a1, b1, triggers[i].tag);
-    }
+    debugf("# SWEEP_A done  found=%lu logged=%lu\n", a_found, a_logged);
 }
 
 /* -------------------------------------------------------------------------
- * Phase 3: Exponent Sweep + Precision Carry-Chain testing
+ * Sweep B: a2 mantissa sweep (step 1)
+ *
+ * Phase 2 sampled every 512th mantissa value plus selected bit-pattern
+ * offsets. This sweep fills in every mantissa at the same exponent (117)
+ * to verify the 5-step periodic formula and catch any non-sampled behavior.
+ * ~8.4 M iterations.
  * ---------------------------------------------------------------------- */
-static void phase3(void)
+static void sweep_b(void)
 {
-    const uint32_t a1 = 0x00000000; 
-    const uint32_t b1 = B2_FORCING; 
-    const uint32_t b2 = B2_FORCING; 
-
-    uint32_t mismatch_count = 0;
-    debugf("# PHASE3 begin: Targeted Exponent & Rounding Sweep\n");
-
-    for (uint32_t exp = 1; exp < 255; exp += 5) {
-        uint32_t exp_base = exp << 23;
-
-        for (uint32_t base_mant = 0; base_mant < (1u << 23); base_mant += 4096) {
-            uint32_t edge_cases[] = {
-                base_mant,
-                base_mant | 0x0F,
-                base_mant | 0x1F,
-                base_mant | 0x3F,
-                base_mant | 0x7F,
-                base_mant | 0xFF,
-                base_mant | 0x1FF,
-                base_mant | 0x3FF
-            };
-
-            for (int e = 0; e < 8; e++) {
-                uint32_t mant = edge_cases[e];
-                if (mant >= (1u << 23)) continue;
-
-                uint32_t a2 = exp_base | mant;
-                uint32_t broken, working;
-                mulmul_probe(a1, b1, a2, b2, &broken, &working);
-
-                if (broken != working) {
-                    log_mismatch("P3", a1, b1, a2, b2, broken, working,
-                                 &logged_phase3, PHASE3_LOG_LIMIT);
-                    mismatch_count++;
-                }
-            }
-        }
-
-        if ((exp & 0x07) == 0) {
-            console_clear();
-            printf("Running Phase 3 (Exp %lu/254)...\n", exp);
-            printf("Total mismatches found: %lu\n", total_discovered);
-            printf("USB logs written:      %lu / %u\n", total_logged, MAX_LOGGED_MISMATCHES);
-            console_render();
-        }
-    }
-    debugf("# PHASE3 done: mismatches=%lu\n", mismatch_count);
-}
-
-/* -------------------------------------------------------------------------
- * Phase 4: Targeted boundary alignment sweep (0x0A00 spike hypothesis)
- * ---------------------------------------------------------------------- */
-static void phase4(void)
-{
-    const uint32_t a1 = 0x00000000;
+    const uint32_t a1 = 0x00000000u;
     const uint32_t b1 = B2_FORCING;
     const uint32_t b2 = B2_FORCING;
-    const uint32_t exp_base = 117u << 23;
-    uint32_t mismatch_count = 0;
-    uint32_t ui_tick_counter = 0;
 
-    debugf("# PHASE4 begin: Boundary alignment spike sweep\n");
+    debugf("# SWEEP_B begin  b1=%08lX b2=%08lX exp_base=%08lX\n",
+           b1, b2, (uint32_t)SWEEP_B_EXP_BASE);
 
-    /* Probe mantissas at suspected spike boundaries (0x0A00, 0x1400, 0x1E00, etc.) */
-    for (uint32_t boundary = 0x0A00; boundary < (1u << 23); boundary += 0x0A00) {
-        
-        /* Dense local sweep around each boundary */
-        for (int offset = -128; offset <= 128; offset += 16) {
-            
-            /* Resolve math explicitly as signed integers before bounds checking */
-            int32_t signed_mant = (int32_t)boundary + offset;
-            if (signed_mant < 0 || signed_mant >= (int32_t)(1u << 23)) continue;
+    for (uint32_t mant = 0x000000u; mant <= 0x7FFFFFu; mant++) {
 
-            uint32_t a2 = exp_base | (uint32_t)signed_mant;
-            uint32_t broken, working;
-            mulmul_probe(a1, b1, a2, b2, &broken, &working);
+        uint32_t a2 = SWEEP_B_EXP_BASE | mant;
+        uint32_t broken, working;
+        mulmul_probe(a1, b1, a2, b2, &broken, &working);
 
-            if (broken != working) {
-                log_mismatch("P4", a1, b1, a2, b2, broken, working,
-                             &logged_phase4, PHASE4_LOG_LIMIT);
-                mismatch_count++;
+        if (broken != working) {
+            b_found++;
+            if (b_logged < SWEEP_B_LOG_LIMIT) {
+                b_logged++;
+                debugf("SB,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX,%08lX\n",
+                       a1, b1, a2, b2, broken, working, broken ^ working);
             }
         }
 
-        /* Periodic UI update (~every 128 boundaries) */
-        if ((++ui_tick_counter & 0x7F) == 0) {
+        /* UI update roughly every 512K iterations */
+        if ((mant & 0x7FFFFu) == 0) {
             console_clear();
-            printf("Running Phase 4 (Boundary %08lX)...\n", boundary);
-            printf("Total mismatches found: %lu\n", total_discovered);
-            printf("USB logs written:      %lu / %u\n", total_logged, MAX_LOGGED_MISMATCHES);
+            printf("Sweep B: a2 mant sweep\n\n");
+            printf("  mant    = %06lX / 7FFFFF\n", mant);
+            printf("  found   = %lu\n", b_found);
+            printf("  logged  = %lu / %lu\n", b_logged, (uint32_t)SWEEP_B_LOG_LIMIT);
             console_render();
         }
     }
 
-    debugf("# PHASE4 done: mismatches=%lu\n", mismatch_count);
+    debugf("# SWEEP_B done  found=%lu logged=%lu\n", b_found, b_logged);
 }
 
 /* -------------------------------------------------------------------------
@@ -322,29 +196,33 @@ int main(void)
 
     console_init();
     console_set_render_mode(RENDER_MANUAL);
-    
-    C1_WRITE_FCR31(C1_FCR31() & ~(C1_ENABLE_OVERFLOW | C1_ENABLE_DIV_BY_0 | C1_ENABLE_INVALID_OP));
+
+    C1_WRITE_FCR31(C1_FCR31() &
+                   ~(C1_ENABLE_OVERFLOW | C1_ENABLE_DIV_BY_0 | C1_ENABLE_INVALID_OP));
 
     console_clear();
-    printf("mulmul characterization ROM (Fast-Targeted)\n");
+    printf("mulmul targeted sweeps\n");
     console_render();
 
-    debugf("# mulmul characterization ROM (Fast-Targeted)\n");
+    debugf("# mulmul targeted sweeps\n");
     debugf("# cols: phase,a1,b1,a2,b2,broken,working,xor\n");
-    debugf("# logging first %u mismatches only; later mismatches are counted but not detailed\n", MAX_LOGGED_MISMATCHES);
-    debugf("# phase budget: P1=%u, P2=%u, P3=%u, P4=%u\n", PHASE1_LOG_LIMIT, PHASE2_LOG_LIMIT, PHASE3_LOG_LIMIT, PHASE4_LOG_LIMIT);
+    debugf("# SA log cap: %lu   SB log cap: %lu\n",
+           (uint32_t)SWEEP_A_LOG_LIMIT, (uint32_t)SWEEP_B_LOG_LIMIT);
 
-    (void)sanity();
+    if (!sanity()) {
+        console_clear();
+        printf("SANITY FAILED\nbug not present on this unit.\n");
+        console_render();
+        while (1) {}
+    }
 
-    phase1();
-    phase2();
-    phase3();
-    phase4();
+    sweep_a();
+    sweep_b();
 
     console_clear();
-    printf("All phases complete.\n");
-    printf("Total mismatches found: %lu\n", total_discovered);
-    printf("Total logs generated:   %lu\n", total_logged);
+    printf("Done.\n\n");
+    printf("Sweep A  found=%lu  logged=%lu\n", a_found, a_logged);
+    printf("Sweep B  found=%lu  logged=%lu\n", b_found, b_logged);
     console_render();
 
     while (1) {}

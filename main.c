@@ -1,17 +1,46 @@
 #include <stdio.h>
 #include <stdint.h>
-#include <string.h>
 #include <libdragon.h>
 
-#define B2_FORCING   0x3F8CCCCDu
-#define SWEEP_A_A2   0x3A800C00u
+/* -----------------------------------------------------------------------
+ * Sanity vector — known to trigger on affected hardware.
+ * Source: prior hardware run (buu42).
+ * ----------------------------------------------------------------------- */
+#define SANITY_A1          0x7F800000u
+#define SANITY_B1          0x37BAD25Fu
+#define SANITY_A2          0x38978B5Du
+#define SANITY_B2          0x0C50A394u
+#define SANITY_EXP_BROKEN  0x05770421u
+#define SANITY_EXP_WORKING 0x05770422u
 
-/* Cap strictly at ~2 mins of USB transfer (assuming 800 logs/sec) */
-#define LOG_LIMIT    100000u 
+/* -----------------------------------------------------------------------
+ * Sweep — Phase-1 parameters, previously confirmed to produce mismatches.
+ *
+ * Hypothesis under test: b1 feeds state through the FPU B-operand path
+ * even when a1=0, so XOR should scale predictably with b1's mantissa.
+ *
+ * a1 = 0 (zero)         mul1 product is always exactly 0;
+ *                        any b1-dependent XOR must come from
+ *                        b1 state in the multiplier, not the result.
+ * a2 = 0x3D4CCCCD       fixed second-multiply operand
+ * b2 = 0x3F8CCCCD (~1.1) forces rounding in mul2
+ * b1 sweeps from smallest positive normal upward
+ *
+ * Tune LOG_LIMIT to control output size.
+ * 2000 rows is a safe starting point.
+ * ----------------------------------------------------------------------- */
+#define SWEEP_A1        0x00000000u
+#define SWEEP_A2        0x3D4CCCCDu
+#define SWEEP_B2        0x3F8CCCCDu
+#define SWEEP_B1_START  0x00800000u   /* smallest positive normal */
+#define SWEEP_B1_END    0x3FFFFFFFu   /* LOG_LIMIT will stop well before here */
 
-static inline void mulmul_probe(uint32_t a1, uint32_t b1, 
-                                uint32_t a2, uint32_t b2, 
-                                uint32_t *broken_out, uint32_t *working_out) 
+#define LOG_LIMIT       10000u
+#define CONSOLE_EVERY   500000u       /* redraw console every N iterations */
+
+static inline void mulmul_probe(uint32_t a1, uint32_t b1,
+                                uint32_t a2, uint32_t b2,
+                                uint32_t *broken_out, uint32_t *working_out)
 {
     uint32_t broken, working;
     __asm__ volatile (
@@ -19,11 +48,11 @@ static inline void mulmul_probe(uint32_t a1, uint32_t b1,
         "mtc1   %3, $f13\n"
         "mtc1   %4, $f14\n"
         "mtc1   %5, $f15\n"
-        /* broken: back-to-back */
+        /* broken: back-to-back muls */
         "mul.s  $f0, $f12, $f13\n"
         "mul.s  $f1, $f14, $f15\n"
         "mfc1   %0, $f1\n"
-        /* working: pipeline flushed with nop */
+        /* working: nop between muls */
         "mul.s  $f0, $f12, $f13\n"
         "nop\n"
         "mul.s  $f1, $f14, $f15\n"
@@ -36,70 +65,106 @@ static inline void mulmul_probe(uint32_t a1, uint32_t b1,
     *working_out = working;
 }
 
-int main(void) 
+int main(void)
 {
     debug_init_isviewer();
     debug_init_usblog();
     console_init();
     console_set_render_mode(RENDER_MANUAL);
 
-    /* Suppress exceptions that might crash the sweep */
-    C1_WRITE_FCR31(C1_FCR31() & ~(C1_ENABLE_OVERFLOW | C1_ENABLE_DIV_BY_0 | C1_ENABLE_INVALID_OP));
+    C1_WRITE_FCR31(C1_FCR31() &
+        ~(C1_ENABLE_OVERFLOW | C1_ENABLE_DIV_BY_0 | C1_ENABLE_INVALID_OP));
 
-    console_clear();
-    printf("Theory #1: Accumulator Leakage Test\nRunning...\n");
-    console_render();
-
-    debugf("# Leakage test (a1 != 0)\n");
-    debugf("# cols: b1,broken,working,xor,residue\n");
-
-    /* High entropy a1 to ensure a complex/dirty multiplier tree */
-    const uint32_t a1 = 0x3F9E0651u; 
-    const uint32_t a2 = SWEEP_A_A2;
-    const uint32_t b2 = B2_FORCING;
-
-    /* Pre-convert a1 to double for the software exact-math check */
-    float fa1;
-    memcpy(&fa1, &a1, 4);
-    double da1 = (double)fa1;
-
-    uint32_t logged = 0;
-
-    /* Sweep b1 across all normal values between 1.0 and 2.0 (~8.3M iterations) */
-    for (uint32_t b1 = 0x3F800000u; b1 <= 0x3FFFFFFFu; b1++) {
+    /* -------------------------------------------------------------------
+     * Sanity check — NON-GATING.
+     * Prints verdict to log and screen; sweep runs regardless of result.
+     * ------------------------------------------------------------------- */
+    const char *sanity_verdict;
+    {
         uint32_t broken, working;
-        mulmul_probe(a1, b1, a2, b2, &broken, &working);
+        mulmul_probe(SANITY_A1, SANITY_B1, SANITY_A2, SANITY_B2,
+                     &broken, &working);
 
-        if (broken != working) {
-            if (logged < LOG_LIMIT) {
-                logged++;
+        if (broken == SANITY_EXP_BROKEN && working == SANITY_EXP_WORKING)
+            sanity_verdict = "PASS";
+        else if (broken == working)
+            sanity_verdict = "NO-BUG";      /* unit unaffected, or probe broken */
+        else
+            sanity_verdict = "UNEXPECTED";  /* triggered but wrong values */
 
-                /* Calculate mathematical exact product to find discarded bits */
-                float fb1;
-                memcpy(&fb1, &b1, 4);
-                
-                union { double d; uint64_t u; } exact_val;
-                exact_val.d = da1 * (double)fb1;
-                
-                /* * A double mantissa is 52 bits. A single mantissa is 23 bits.
-                 * Single precision keeps the top 23 bits of this exact product.
-                 * The remaining lower 29 bits contain the "residue" (Guard, Round, 
-                 * Sticky, and discarded bits) that were active in the ALU.
-                 */
-                uint32_t residue = (uint32_t)(exact_val.u & 0x1FFFFFFFllu);
-
-                debugf("%08lX,%08lX,%08lX,%08lX,%08lX\n", b1, broken, working, broken ^ working, residue);
-            } else {
-                /* Hard abort to respect the 5-minute runtime constraint */
-                break; 
-            }
-        }
+        debugf("# SANITY %s broken=%08lX working=%08lX xor=%08lX\n",
+               sanity_verdict,
+               (unsigned long)broken,
+               (unsigned long)working,
+               (unsigned long)(broken ^ working));
     }
 
     console_clear();
-    printf("Done.\nLogged: %lu\n", logged);
+    printf("Sanity: %s\n\nSweeping...\n", sanity_verdict);
     console_render();
-    debugf("# DONE\n");
+
+    /* -------------------------------------------------------------------
+     * Main sweep.
+     *
+     * CSV output columns:
+     *   b1         — sweep input (hex)
+     *   xor        — broken XOR working (hex): which bits differ
+     *   delta_ulps — |broken - working| (decimal): magnitude of error
+     *
+     * For positive normals in the same binade, delta_ulps equals the
+     * raw integer difference between the two bit patterns, which is
+     * the number of representable values between them (ULP count).
+     * xor and delta_ulps are related but not equal for multi-bit errors.
+     * ------------------------------------------------------------------- */
+    debugf("# SWEEP a1=%08lX a2=%08lX b2=%08lX limit=%lu\n",
+           (unsigned long)SWEEP_A1,
+           (unsigned long)SWEEP_A2,
+           (unsigned long)SWEEP_B2,
+           (unsigned long)LOG_LIMIT);
+    debugf("# b1,xor,delta_ulps\n");
+
+    uint32_t logged = 0;
+    uint32_t b1;
+
+    for (b1 = SWEEP_B1_START; b1 <= SWEEP_B1_END; b1++) {
+
+        /* Periodic console update so the screen is not blank */
+        if ((b1 - SWEEP_B1_START) % CONSOLE_EVERY == 0) {
+            console_clear();
+            printf("Sanity: %s\n\nb1:     %08lX\nLogged: %lu / %lu\n",
+                   sanity_verdict,
+                   (unsigned long)b1,
+                   (unsigned long)logged,
+                   (unsigned long)LOG_LIMIT);
+            console_render();
+        }
+
+        uint32_t broken, working;
+        mulmul_probe(SWEEP_A1, b1, SWEEP_A2, SWEEP_B2, &broken, &working);
+
+        if (broken != working) {
+            uint32_t delta = (broken > working)
+                             ? (broken - working)
+                             : (working - broken);
+
+            debugf("%08lX,%08lX,%lu\n",
+                   (unsigned long)b1,
+                   (unsigned long)(broken ^ working),
+                   (unsigned long)delta);
+
+            if (++logged >= LOG_LIMIT)
+                break;
+        }
+    }
+
+    debugf("# DONE logged=%lu last_b1=%08lX\n",
+           (unsigned long)logged,
+           (unsigned long)b1);
+
+    console_clear();
+    printf("Sanity: %s\n\nDone.\nLogged: %lu\n",
+           sanity_verdict, (unsigned long)logged);
+    console_render();
 
     while (1) {}
 }

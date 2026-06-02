@@ -26,21 +26,24 @@
  * b2 = 0x3F8CCCCD (~1.1) forces rounding in mul2
  * b1 sweeps from smallest positive normal upward
  *
- * Tune LOG_LIMIT to control output size.
- * 2000 rows is a safe starting point.
+ * Tune LOG_LIMIT to control output size/runtime.
+ * ~800 lines logged per second via USB (bottleneck)
  * ----------------------------------------------------------------------- */
 #define SWEEP_A1        0x00000000u
 #define SWEEP_A2        0x3D4CCCCDu
 #define SWEEP_B2        0x3F8CCCCDu
 #define SWEEP_B1_START  0x00800000u   /* smallest positive normal */
-#define SWEEP_B1_END    0x3FFFFFFFu   /* LOG_LIMIT will stop well before here */
+#define SWEEP_B1_END    0x3FFFFFFFu   /* LOG_LIMIT will abridge this */
 
 #define LOG_LIMIT       10000u
 #define CONSOLE_EVERY   500000u       /* redraw console every N iterations */
 
-static inline void mulmul_probe(uint32_t a1, uint32_t b1,
-                                uint32_t a2, uint32_t b2,
-                                uint32_t *broken_out, uint32_t *working_out)
+static inline void mulmul_probe(uint32_t a1, 
+                                uint32_t b1,
+                                uint32_t a2, 
+                                uint32_t b2,
+                                uint32_t *broken_out, 
+                                uint32_t *working_out)
 {
     uint32_t broken, working;
     __asm__ volatile (

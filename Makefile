@@ -1,7 +1,6 @@
-N64_INST  = /n64_toolchain
-PROG_NAME = mulmul_characterize
+N64_INST ?= /n64_toolchain
 
-all: $(PROG_NAME).z64
+PROG_NAME = mulmul_characterize
 
 OBJS = main.o
 
@@ -12,4 +11,4 @@ $(PROG_NAME).elf: $(OBJS)
 clean:
 	rm -f *.o *.elf *.z64
 
-.PHONY: all clean
+.PHONY: clean
